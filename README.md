@@ -1,4 +1,4 @@
-# Triton
+# Choreo
 
 Robust, reliable and resilient distributed workflow engine.
 Uses [Redis](https://redis.io/) as the message broker and result backend.
