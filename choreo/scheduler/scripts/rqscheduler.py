@@ -8,9 +8,11 @@ from redis import Redis
 from choreo.scheduler.scheduler import Scheduler
 
 from choreo.scheduler.utils import setup_loghandlers
+from choreo.multirq.cli.cli import main as multirq
 
 
-def main():
+@multirq.command()
+def scheduler():
     parser = argparse.ArgumentParser(description='Runs RQ scheduler')
     parser.add_argument('-b', '--burst', action='store_true', default=False, help='Run in burst mode (quit after all work is done)')
     parser.add_argument('-H', '--host', default=os.environ.get('RQ_REDIS_HOST', 'localhost'), help="Redis host")
@@ -30,7 +32,7 @@ def main():
     parser.add_argument('-j', '--job-class', help='Custom RQ Job class')
     parser.add_argument('-q', '--queue-class', help='Custom RQ Queue class')
 
-    args = parser.parse_args()
+    args = parser.parse_args(sys.argv[2:])
 
     if args.path:
         sys.path = args.path.split(':') + sys.path
@@ -60,5 +62,6 @@ def main():
                           queue_class=args.queue_class)
     scheduler.run(burst=args.burst)
 
+
 if __name__ == '__main__':
-    main()
+    scheduler()

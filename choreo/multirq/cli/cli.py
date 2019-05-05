@@ -24,7 +24,6 @@ from choreo.multirq.utils import import_attribute
 from choreo.multirq.suspension import (suspend as connection_suspend,
                            resume as connection_resume, is_suspended)
 
-
 # Disable the warning that Click displays (as of Click version 5.0) when users
 # use unicode_literals in Python 2.
 # See http://click.pocoo.org/dev/python3/#unicode-literals for more details.

@@ -11,6 +11,7 @@ from flask import Flask, Response, request
 from . import default_settings
 from .version import VERSION
 from .web import blueprint
+from choreo.multirq.cli.cli import main as multirq
 
 
 def add_basic_auth(blueprint, username, password, realm='RQ Dashboard'):
@@ -53,7 +54,7 @@ def make_flask_app(config, username, password, url_prefix):
     return app
 
 
-@click.command()
+@multirq.command()
 @click.option(
     '-b', '--bind', default='0.0.0.0',
     help='IP or hostname on which to bind HTTP server')
@@ -106,7 +107,7 @@ def make_flask_app(config, username, password, url_prefix):
     '--delete-jobs', default=False, help='Delete jobs instead of cancel')
 @click.option(
     '--debug/--normal', default=False, help='Enter DEBUG mode')
-def run(
+def dashboard(
         bind, port, url_prefix, username, password,
         config,
         redis_host, redis_port, redis_password, redis_database, redis_url,
@@ -153,4 +154,4 @@ def run(
 
 
 def main():
-    run(auto_envvar_prefix='RQ_DASHBOARD')
+    dashboard(auto_envvar_prefix='RQ_DASHBOARD')
