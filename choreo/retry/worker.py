@@ -1,13 +1,12 @@
 import os
 from datetime import datetime, timedelta
-from choreo.multirq.queue import Queue
 from choreo.multirq.worker import Worker
 from .queue import DeadLetterQueue
 
 try:
-    import choreo.scheduler
+    import scheduler as choreo_scheduler
 except ImportError:
-    choreo.scheduler = None
+    choreo_scheduler = None
 
 
 class RetryWorker(Worker):
@@ -104,7 +103,7 @@ class RetryWorker(Worker):
 
     @property
     def use_scheduler(self):
-        return choreo.scheduler is not None and len(self.delays) > 0
+        return choreo_scheduler is not None and len(self.delays) > 0
 
     @property
     def should_run_maintenance_tasks(self):
@@ -144,8 +143,8 @@ class RetryWorker(Worker):
             except IndexError:
                 delay = self.delays[-1]
 
-            scheduler = choreo.scheduler.Scheduler(connection=self.connection,
-                                               queue_name=job.origin)
+            scheduler = choreo_scheduler.Scheduler(connection=self.connection,
+                                                   queue_name=job.origin)
 
             self.failed_queue.remove(job)
             job = scheduler.enqueue_in(timedelta(seconds=delay),
@@ -153,10 +152,12 @@ class RetryWorker(Worker):
                                        *job.args,
                                        **job.kwargs)
             job.meta['tries'] = tries + 1
+            job.meta['old_job_id'] = job.id
             job.save()
             self.log.info('scheduled to run in {} seconds'.format(delay))
         else:
             job.meta['tries'] += 1
+            job.meta['old_job_id'] = job.id
             job.save()
             self.failed_queue.requeue(job.id)
             self.log.info('requeued')

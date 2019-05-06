@@ -7,7 +7,7 @@ import random
 
 def main():
     queue = Queue(connection=Redis())
-    result = queue.enqueue('tasks.sleepy', args=(random.randint(90, 100),), timeout=150)
+    result = queue.enqueue('tasks.sleepy', args=(random.randint(20, 20),), timeout=10)
 
     tic = time.time()
     while result.get_status() not in ('finished', 'failed'):

@@ -19,12 +19,12 @@ def scheduler():
     parser.add_argument('-p', '--port', default=int(os.environ.get('RQ_REDIS_PORT', 6379)), type=int, help="Redis port number")
     parser.add_argument('-d', '--db', default=int(os.environ.get('RQ_REDIS_DB', 0)), type=int, help="Redis database")
     parser.add_argument('-P', '--password', default=os.environ.get('RQ_REDIS_PASSWORD'), help="Redis password")
-    parser.add_argument('--verbose', '-v', action='store_true', default=False, help='Show more output')
+    parser.add_argument('--verbose', '-v', action='store_true', default=True, help='Show more output')
     parser.add_argument('--quiet', action='store_true', default=False, help='Show less output')
     parser.add_argument('--url', '-u', default=os.environ.get('RQ_REDIS_URL')
         , help='URL describing Redis connection details. \
             Overrides other connection arguments if supplied.')
-    parser.add_argument('-i', '--interval', default=60.0, type=float
+    parser.add_argument('-i', '--interval', default=5.0, type=float
         , help="How often the scheduler checks for new jobs to add to the \
             queue (in seconds, can be floating-point for more precision).")
     parser.add_argument('--path', default='.', help='Specify the import path.')
