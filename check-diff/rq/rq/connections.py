@@ -4,8 +4,9 @@ from __future__ import (absolute_import, division, print_function,
 
 from contextlib import contextmanager
 
-from redis import Redis
+from redis import StrictRedis
 
+from .compat.connections import patch_connection
 from .local import LocalStack, release_local
 
 
@@ -16,7 +17,7 @@ class NoRedisConnectionException(Exception):
 @contextmanager
 def Connection(connection=None):  # noqa
     if connection is None:
-        connection = Redis()
+        connection = StrictRedis()
     push_connection(connection)
     try:
         yield
@@ -29,7 +30,7 @@ def Connection(connection=None):  # noqa
 
 def push_connection(redis):
     """Pushes the given connection on the stack."""
-    _connection_stack.push(redis)
+    _connection_stack.push(patch_connection(redis))
 
 
 def pop_connection():
@@ -46,7 +47,7 @@ def use_connection(redis=None):
     release_local(_connection_stack)
 
     if redis is None:
-        redis = Redis()
+        redis = StrictRedis()
     push_connection(redis)
 
 
@@ -62,7 +63,7 @@ def resolve_connection(connection=None):
     Raises an exception if it cannot resolve a connection now.
     """
     if connection is not None:
-        return connection
+        return patch_connection(connection)
 
     connection = get_current_connection()
     if connection is None:

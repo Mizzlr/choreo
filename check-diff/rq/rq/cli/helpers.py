@@ -9,7 +9,7 @@ from functools import partial
 
 import click
 import redis
-from redis import Redis
+from redis import StrictRedis
 from redis.sentinel import Sentinel
 from rq.defaults import (DEFAULT_CONNECTION_CLASS, DEFAULT_JOB_CLASS,
                          DEFAULT_QUEUE_CLASS, DEFAULT_WORKER_CLASS)
@@ -30,7 +30,7 @@ def read_config_file(module):
                  if k.upper() == k])
 
 
-def get_redis_from_config(settings, connection_class=Redis):
+def get_redis_from_config(settings, connection_class=StrictRedis):
     """Returns a StrictRedis instance from a dictionary of settings.
        To use redis sentinel, you must specify a dictionary in the configuration file.
        Example of a dictionary with keys without values:
@@ -53,9 +53,22 @@ def get_redis_from_config(settings, connection_class=Redis):
         'port': settings.get('REDIS_PORT', 6379),
         'db': settings.get('REDIS_DB', 0),
         'password': settings.get('REDIS_PASSWORD', None),
-        'ssl': settings.get('REDIS_SSL', False),
     }
 
+    use_ssl = settings.get('REDIS_SSL', False)
+    if use_ssl:
+        # If SSL is required, we need to depend on redis-py being 2.10 at
+        # least
+        def safeint(x):
+            try:
+                return int(x)
+            except ValueError:
+                return 0
+
+        version_info = tuple(safeint(x) for x in redis.__version__.split('.'))
+        if not version_info >= (2, 10):
+            raise RuntimeError('Using SSL requires a redis-py version >= 2.10')
+        kwargs['ssl'] = use_ssl
     return connection_class(**kwargs)
 
 
@@ -124,49 +137,48 @@ def show_workers(queues, raw, by_queue, queue_class, worker_class):
     if queues:
         qs = list(map(queue_class, queues))
 
-        workers = set()
-        for queue in qs:
-            for worker in worker_class.all(queue=queue):
-                workers.add(worker)
+        def any_matching_queue(worker):
+            def queue_matches(q):
+                return q in qs
+            return any(map(queue_matches, worker.queues))
+
+        # Filter out workers that don't match the queue filter
+        ws = [w for w in worker_class.all() if any_matching_queue(w)]
+
+        def filter_queues(queue_names):
+            return [qname for qname in queue_names if queue_class(qname) in qs]
 
     else:
         qs = queue_class.all()
-        workers = worker_class.all()
+        ws = worker_class.all()
+        filter_queues = (lambda x: x)
 
     if not by_queue:
-
-        for worker in workers:
-            queue_names = ', '.join(worker.queue_names())
-            name = '%s (%s %s)' % (worker.name, worker.hostname, worker.pid)
+        for w in ws:
+            worker_queues = filter_queues(w.queue_names())
             if not raw:
-                click.echo('%s: %s %s' % (name, state_symbol(worker.get_state()), queue_names))
+                click.echo('%s %s: %s' % (w.name, state_symbol(w.get_state()), ', '.join(worker_queues)))
             else:
-                click.echo('worker %s %s %s' % (name, worker.get_state(), queue_names))
-
+                click.echo('worker %s %s %s' % (w.name, w.get_state(), ','.join(worker_queues)))
     else:
-        # Display workers by queue
-        queue_dict = {}
-        for queue in qs:
-            queue_dict[queue] = worker_class.all(queue=queue)
+        # Create reverse lookup table
+        queues = dict([(q, []) for q in qs])
+        for w in ws:
+            for q in w.queues:
+                if q not in queues:
+                    continue
+                queues[q].append(w)
 
-        if queue_dict:
-            max_length = max([len(q.name) for q, in queue_dict.keys()])
-        else:
-            max_length = 0
-
-        for queue in queue_dict:
-            if queue_dict[queue]:
-                queues_str = ", ".join(
-                    sorted(
-                        map(lambda w: '%s (%s)' % (w.name, state_symbol(w.get_state())), queue_dict[queue])
-                    )
-                )
+        max_qname = max(map(lambda q: len(q.name), queues.keys())) if queues else 0
+        for q in queues:
+            if queues[q]:
+                queues_str = ", ".join(sorted(map(lambda w: '%s (%s)' % (w.name, state_symbol(w.get_state())), queues[q])))  # noqa
             else:
                 queues_str = '–'
-            click.echo('%s %s' % (pad(queue.name + ':', max_length + 1), queues_str))
+            click.echo('%s %s' % (pad(q.name + ':', max_qname + 1), queues_str))
 
     if not raw:
-        click.echo('%d workers, %d queues' % (len(workers), len(qs)))
+        click.echo('%d workers, %d queues' % (len(ws), len(qs)))
 
 
 def show_both(queues, raw, by_queue, queue_class, worker_class):
@@ -191,7 +203,7 @@ def refresh(interval, func, *args):
             break
 
 
-def setup_loghandlers_from_args(verbose, quiet, date_format, log_format):
+def setup_loghandlers_from_args(verbose, quiet):
     if verbose and quiet:
         raise RuntimeError("Flags --verbose and --quiet are mutually exclusive.")
 
@@ -201,7 +213,7 @@ def setup_loghandlers_from_args(verbose, quiet, date_format, log_format):
         level = 'WARNING'
     else:
         level = 'INFO'
-    setup_loghandlers(level, date_format=date_format, log_format=log_format)
+    setup_loghandlers(level)
 
 
 class CliConfig(object):

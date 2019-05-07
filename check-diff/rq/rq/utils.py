@@ -14,10 +14,7 @@ import importlib
 import logging
 import numbers
 import sys
-try:
-    from collections.abc import Iterable
-except ImportError:
-    from collections import Iterable
+from collections import Iterable
 
 from .compat import as_text, is_python_version, string_types
 from .exceptions import TimeoutFormatError
@@ -250,13 +247,6 @@ def backend_class(holder, default_name, override=None):
         return import_attribute(override)
     else:
         return override
-
-
-def str_to_date(date_str):
-    if date_str is None:
-        return
-    else:
-        return utcparse(as_text(date_str))
 
 
 def parse_timeout(timeout):

@@ -13,9 +13,10 @@ def is_python_version(*versions):
     return False
 
 
-try:
+# functools.total_ordering is only available from Python 2.7 and 3.2
+if is_python_version((2, 7), (3, 2)):
     from functools import total_ordering
-except ImportError:
+else:
     def total_ordering(cls):  # noqa
         """Class decorator that fills in missing ordering methods"""
         convert = {
@@ -35,7 +36,7 @@ except ImportError:
         roots = set(dir(cls)) & set(convert)
         if not roots:
             raise ValueError('must define at least one ordering operation: < > <= >=')  # noqa
-        root = max(roots)  # prefer __lt__ to __le__ to __gt__ to __ge__
+        root = max(roots)       # prefer __lt__ to __le__ to __gt__ to __ge__
         for opname, opfunc in convert[root]:
             if opname not in roots:
                 opfunc.__name__ = str(opname)

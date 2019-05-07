@@ -3,17 +3,21 @@ from __future__ import (absolute_import, division, print_function,
                         unicode_literals)
 
 import uuid
-import warnings
 
 from redis import WatchError
 
 from .compat import as_text, string_types, total_ordering
 from .connections import resolve_connection
 from .defaults import DEFAULT_RESULT_TTL
-from .exceptions import (DequeueTimeout, InvalidJobDependency, NoSuchJobError,
-                         UnpickleError)
+from .exceptions import (DequeueTimeout, InvalidJobDependency,
+                         InvalidJobOperationError, NoSuchJobError, UnpickleError)
 from .job import Job, JobStatus
 from .utils import backend_class, import_attribute, utcnow, parse_timeout
+
+
+def get_failed_queue(connection=None, job_class=None):
+    """Returns a handle to the special failed queue."""
+    return FailedQueue(connection=connection, job_class=job_class)
 
 
 def compact(lst):
@@ -54,17 +58,13 @@ class Queue(object):
         return cls(name, connection=connection, job_class=job_class)
 
     def __init__(self, name='default', default_timeout=None, connection=None,
-                 is_async=True, job_class=None, **kwargs):
+                 async=True, job_class=None):
         self.connection = resolve_connection(connection)
         prefix = self.redis_queue_namespace_prefix
         self.name = name
         self._key = '{0}{1}'.format(prefix, name)
-        self._default_timeout = parse_timeout(default_timeout) or self.DEFAULT_TIMEOUT
-        self._is_async = is_async
-
-        if 'async' in kwargs:
-            self._is_async = kwargs['async']
-            warnings.warn('The `async` keyword is deprecated. Use `is_async` instead', DeprecationWarning)
+        self._default_timeout = parse_timeout(default_timeout)
+        self._async = async
 
         # override class attribute job_class if one was passed
         if job_class is not None:
@@ -89,21 +89,10 @@ class Queue(object):
         """Returns the Redis key for this Queue."""
         return self._key
 
-    @property
-    def registry_cleaning_key(self):
-        """Redis key used to indicate this queue has been cleaned."""
-        return 'rq:clean_registries:%s' % self.name
-
-    def acquire_cleaning_lock(self):
-        """Returns a boolean indicating whether a lock to clean this queue
-        is acquired. A lock expires in 899 seconds (15 minutes - 1 second)
-        """
-        return self.connection.set(self.registry_cleaning_key, 1, nx=1, ex=899)
-
     def empty(self):
         """Removes all messages on the queue."""
-        script = """
-            local prefix = "{0}"
+        script = b"""
+            local prefix = "rq:job:"
             local q = KEYS[1]
             local count = 0
             while true do
@@ -118,7 +107,7 @@ class Queue(object):
                 count = count + 1
             end
             return count
-        """.format(self.job_class.redis_job_namespace_prefix).encode("utf-8")
+        """
         script = self.connection.register_script(script)
         return script(keys=[self.key])
 
@@ -127,7 +116,7 @@ class Queue(object):
         if delete_jobs:
             self.empty()
 
-        with self.connection.pipeline() as pipeline:
+        with self.connection._pipeline() as pipeline:
             pipeline.srem(self.redis_queues_keys, self._key)
             pipeline.delete(self._key)
             pipeline.execute()
@@ -136,18 +125,14 @@ class Queue(object):
         """Returns whether the current queue is empty."""
         return self.count == 0
 
-    @property
-    def is_async(self):
-        """Returns whether the current queue is async."""
-        return bool(self._is_async)
-
     def fetch_job(self, job_id):
         try:
             job = self.job_class.fetch(job_id, connection=self.connection)
         except NoSuchJobError:
             self.remove(job_id)
         else:
-            if job.origin == self.name:
+            if job.origin == self.name or \
+                    (job.is_failed and self == get_failed_queue(connection=self.connection, job_class=self.job_class)):
                 return job
 
     def get_job_ids(self, offset=0, length=-1):
@@ -180,12 +165,6 @@ class Queue(object):
         """Returns a count of all messages in the queue."""
         return self.connection.llen(self.key)
 
-    @property
-    def failed_job_registry(self):
-        """Returns this queue's FailedJobRegistry."""
-        from rq.registry import FailedJobRegistry
-        return FailedJobRegistry(queue=self)
-
     def remove(self, job_or_id, pipeline=None):
         """Removes Job from queue, accepts either a Job instance or ID."""
         job_id = job_or_id.id if isinstance(job_or_id, self.job_class) else job_or_id
@@ -194,14 +173,13 @@ class Queue(object):
             pipeline.lrem(self.key, 1, job_id)
             return
 
-        return self.connection.lrem(self.key, 1, job_id)
+        return self.connection._lrem(self.key, 1, job_id)
 
     def compact(self):
         """Removes all "dead" jobs from the queue by cycling through it, while
         guaranteeing FIFO semantics.
         """
-        COMPACT_QUEUE = '{0}_compact:{1}'.format(
-            self.redis_queue_namespace_prefix, uuid.uuid4())  # noqa
+        COMPACT_QUEUE = 'rq:queue:_compact:{0}'.format(uuid.uuid4())  # noqa
 
         self.connection.rename(self.key, COMPACT_QUEUE)
         while True:
@@ -221,9 +199,8 @@ class Queue(object):
             connection.rpush(self.key, job_id)
 
     def enqueue_call(self, func, args=None, kwargs=None, timeout=None,
-                     result_ttl=None, ttl=None, failure_ttl=None,
-                     description=None, depends_on=None, job_id=None,
-                     at_front=False, meta=None):
+                     result_ttl=None, ttl=None, description=None,
+                     depends_on=None, job_id=None, at_front=False, meta=None):
         """Creates a job to represent the delayed function call and enqueues
         it.
 
@@ -233,39 +210,50 @@ class Queue(object):
         """
         timeout = parse_timeout(timeout) or self._default_timeout
         result_ttl = parse_timeout(result_ttl)
-        failure_ttl = parse_timeout(failure_ttl)
         ttl = parse_timeout(ttl)
 
         job = self.job_class.create(
             func, args=args, kwargs=kwargs, connection=self.connection,
-            result_ttl=result_ttl, ttl=ttl, failure_ttl=failure_ttl,
-            status=JobStatus.QUEUED, description=description,
-            depends_on=depends_on, timeout=timeout, id=job_id,
-            origin=self.name, meta=meta)
+            result_ttl=result_ttl, ttl=ttl, status=JobStatus.QUEUED,
+            description=description, depends_on=depends_on,
+            timeout=timeout, id=job_id, origin=self.name, meta=meta)
 
         # If job depends on an unfinished job, register itself on it's
         # parent's dependents instead of enqueueing it.
         # If WatchError is raised in the process, that means something else is
         # modifying the dependency. In this case we simply retry
-        if depends_on is not None:
-            if not isinstance(depends_on, self.job_class):
-                depends_on = self.job_class(id=depends_on,
-                                            connection=self.connection)
-            with self.connection.pipeline() as pipe:
+        if depends_on:
+            if not isinstance(depends_on, list):
+                if not isinstance(depends_on, self.job_class):
+                    depends_on = Job(id=depends_on, connection=self.connection)
+
+                dependencies = [depends_on]
+            else:
+                dependencies = [dep if isinstance(dep, self.job_class)
+                                else Job(id=dep, connection=self.connection)
+                                for dep in depends_on]
+
+            remaining_dependencies = []
+            with self.connection._pipeline() as pipe:
                 while True:
                     try:
-                        pipe.watch(depends_on.key)
+                        pipe.watch(*[dependency.key for dependency in dependencies])
 
-                        # If the dependency does not exist, raise an
-                        # exception to avoid creating an orphaned job.
-                        if not self.job_class.exists(depends_on.id,
-                                                     self.connection):
-                            raise InvalidJobDependency('Job {0} does not exist'.format(depends_on.id))
+                        for dependency in dependencies:
+                            if dependency.get_status() != JobStatus.FINISHED:
+                                remaining_dependencies.append(dependency)
 
-                        if depends_on.get_status() != JobStatus.FINISHED:
+                            # If the dependency does not exist, raise an
+                            # exception to avoid creating an orphaned job.
+                            if not self.job_class.exists(dependency.id,
+                                                         self.connection):
+                                raise InvalidJobDependency('Job {0} does not exist'.format(dependency.id))
+
+                        if remaining_dependencies:
                             pipe.multi()
                             job.set_status(JobStatus.DEFERRED)
-                            job.register_dependency(pipeline=pipe)
+                            job.register_dependencies(remaining_dependencies,
+                                                      pipeline=pipe)
                             job.save(pipeline=pipe)
                             job.cleanup(ttl=job.ttl, pipeline=pipe)
                             pipe.execute()
@@ -304,12 +292,11 @@ class Queue(object):
                              'by workers')
 
         # Detect explicit invocations, i.e. of the form:
-        #     q.enqueue(foo, args=(1, 2), kwargs={'a': 1}, job_timeout=30)
-        timeout = kwargs.pop('job_timeout', None)
+        #     q.enqueue(foo, args=(1, 2), kwargs={'a': 1}, timeout=30)
+        timeout = kwargs.pop('timeout', None)
         description = kwargs.pop('description', None)
         result_ttl = kwargs.pop('result_ttl', None)
         ttl = kwargs.pop('ttl', None)
-        failure_ttl = kwargs.pop('failure_ttl', None)
         depends_on = kwargs.pop('depends_on', None)
         job_id = kwargs.pop('job_id', None)
         at_front = kwargs.pop('at_front', False)
@@ -320,19 +307,17 @@ class Queue(object):
             args = kwargs.pop('args', None)
             kwargs = kwargs.pop('kwargs', None)
 
-        return self.enqueue_call(
-            func=f, args=args, kwargs=kwargs, timeout=timeout,
-            result_ttl=result_ttl, ttl=ttl, failure_ttl=failure_ttl,
-            description=description, depends_on=depends_on, job_id=job_id,
-            at_front=at_front, meta=meta
-        )
+        return self.enqueue_call(func=f, args=args, kwargs=kwargs,
+                                 timeout=timeout, result_ttl=result_ttl, ttl=ttl,
+                                 description=description, depends_on=depends_on,
+                                 job_id=job_id, at_front=at_front, meta=meta)
 
     def enqueue_job(self, job, pipeline=None, at_front=False):
         """Enqueues a job for delayed execution.
 
-        If Queue is instantiated with is_async=False, job is executed immediately.
+        If Queue is instantiated with async=False, job is executed immediately.
         """
-        pipe = pipeline if pipeline is not None else self.connection.pipeline()
+        pipe = pipeline if pipeline is not None else self.connection._pipeline()
 
         # Add Queue key set
         pipe.sadd(self.redis_queues_keys, self.key)
@@ -342,17 +327,17 @@ class Queue(object):
         job.enqueued_at = utcnow()
 
         if job.timeout is None:
-            job.timeout = self._default_timeout
+            job.timeout = self.DEFAULT_TIMEOUT
         job.save(pipeline=pipe)
         job.cleanup(ttl=job.ttl, pipeline=pipe)
 
-        if self._is_async:
+        if self._async:
             self.push_job_id(job.id, pipeline=pipe, at_front=at_front)
 
         if pipeline is None:
             pipe.execute()
 
-        if not self._is_async:
+        if not self._async:
             job = self.run_job(job)
 
         return job
@@ -360,15 +345,20 @@ class Queue(object):
     def enqueue_dependents(self, job, pipeline=None):
         """Enqueues all jobs in the given job's dependents set and clears it.
 
+        Usually this is called by the worker which watches the dependency key of
+        the job for changes. This prevents jobs being lost which are enqueued
+        during this function call
+
         When called without a pipeline, this method uses WATCH/MULTI/EXEC.
         If you pass a pipeline, only MULTI is called. The rest is up to the
         caller.
         """
         from .registry import DeferredJobRegistry
 
-        pipe = pipeline if pipeline is not None else self.connection.pipeline()
+        pipe = pipeline if pipeline is not None else self.connection._pipeline()
         dependents_key = job.dependents_key
 
+        to_enqueue = []
         while True:
             try:
                 # if a pipeline is passed, the caller is responsible for calling WATCH
@@ -381,31 +371,55 @@ class Queue(object):
 
                 pipe.multi()
 
+                # Collect dependents to be enqueued
                 for dependent in dependent_jobs:
-                    registry = DeferredJobRegistry(dependent.origin,
-                                                   self.connection,
-                                                   job_class=self.job_class)
-                    registry.remove(dependent, pipeline=pipe)
-                    if dependent.origin == self.name:
-                        self.enqueue_job(dependent, pipeline=pipe)
-                    else:
-                        queue = Queue(name=dependent.origin, connection=self.connection)
-                        queue.enqueue_job(dependent, pipeline=pipe)
+                    dependent.remove_dependency(job.id)
+                    if dependent.has_unmet_dependencies() is False:
+                        registry = DeferredJobRegistry(dependent.origin,
+                                                       self.connection,
+                                                       job_class=self.job_class)
+                        registry.remove(dependent, pipeline=pipe)
+                        if dependent.origin == self.name:
+                            queue = self
+                        else:
+                            queue = Queue(name=dependent.origin, connection=self.connection)
 
-                pipe.delete(dependents_key)
+                        to_enqueue.append({'queue': queue, 'job': dependent})
+
+                # NOTE: On job cleanup, all keys will be removed, but cleanup
+                # happens only if parent job is actually enqueued.
+                # If a user uses q.enqueue_dependents manually without enqueuing
+                # the parent job, job.cleanup() is not run for the parent job
+                pipe.delete(job.dependents_key)
 
                 if pipeline is None:
                     pipe.execute()
 
                 break
             except WatchError:
+                # The dependents key of the finished job has changed
+                # Check dependents again
                 if pipeline is None:
                     continue
                 else:
-                    # if the pipeline comes from the caller, we re-raise the
+                    # If the pipeline comes from the caller, we re-raise the
                     # exception as it it the responsibility of the caller to
                     # handle it
                     raise
+
+        # Do actual enqueuing of dependents while watching for enqueuing of the
+        # same dependent by another worker
+        for item in to_enqueue:
+            try:
+                if pipeline is None:
+                    pipe.watch(item['job'].key)
+                pipe.multi()
+                item['queue'].enqueue_job(item['job'], pipeline=pipe)
+                if pipeline is None:
+                    pipe.execute()
+            except WatchError:
+                # Another worker enqueued this job which changed its status
+                pass
 
     def pop_job_id(self):
         """Pops a given job ID from this Redis queue."""
@@ -440,6 +454,28 @@ class Queue(object):
                 if blob is not None:
                     return queue_key, blob
             return None
+
+    def dequeue(self):
+        """Dequeues the front-most job from this queue.
+
+        Returns a job_class instance, which can be executed or inspected.
+        """
+        while True:
+            job_id = self.pop_job_id()
+            if job_id is None:
+                return None
+            try:
+                job = self.job_class.fetch(job_id, connection=self.connection)
+            except NoSuchJobError as e:
+                # Silently pass on jobs that don't exist (anymore),
+                continue
+            except UnpickleError as e:
+                # Attach queue information on the exception for improved error
+                # reporting
+                e.job_id = job_id
+                e.queue = self
+                raise e
+            return job
 
     @classmethod
     def dequeue_any(cls, queues, timeout, connection=None, job_class=None):
@@ -499,3 +535,48 @@ class Queue(object):
 
     def __str__(self):
         return '<{0} {1}>'.format(self.__class__.__name__, self.name)
+
+
+class FailedQueue(Queue):
+    def __init__(self, connection=None, job_class=None):
+        super(FailedQueue, self).__init__(JobStatus.FAILED,
+                                          connection=connection,
+                                          job_class=job_class)
+
+    def quarantine(self, job, exc_info):
+        """Puts the given Job in quarantine (i.e. put it on the failed
+        queue).
+        """
+
+        with self.connection._pipeline() as pipeline:
+            # Add Queue key set
+            self.connection.sadd(self.redis_queues_keys, self.key)
+
+            job.exc_info = exc_info
+            job.save(pipeline=pipeline, include_meta=False)
+            job.cleanup(ttl=-1, pipeline=pipeline)  # failed job won't expire
+
+            self.push_job_id(job.id, pipeline=pipeline)
+            pipeline.execute()
+
+        return job
+
+    def requeue(self, job_id):
+        """Requeues the job with the given job ID."""
+        try:
+            job = self.job_class.fetch(job_id, connection=self.connection)
+        except NoSuchJobError:
+            # Silently ignore/remove this job and return (i.e. do nothing)
+            self.remove(job_id)
+            return
+
+        # Delete it from the failed queue (raise an error if that failed)
+        if self.remove(job) == 0:
+            raise InvalidJobOperationError('Cannot requeue non-failed jobs')
+
+        job.set_status(JobStatus.QUEUED)
+        job.exc_info = None
+        queue = Queue(job.origin,
+                      connection=self.connection,
+                      job_class=self.job_class)
+        return queue.enqueue_job(job)
